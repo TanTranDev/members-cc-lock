@@ -1,7 +1,8 @@
 // @ts-check
 import fs from 'node:fs';
 import path from 'node:path';
-import { stateDir } from './paths.mjs';
+import { execFileSync } from 'node:child_process';
+import { stateDir, sha1 } from './paths.mjs';
 
 const DEFAULTS = {
   enabled: true,
@@ -14,6 +15,9 @@ const DEFAULTS = {
   waitPollSec: 5,
   offlinePolicy: 'fail-closed',
   guardedTools: ['Edit', 'Write', 'MultiEdit', 'NotebookEdit'],
+  mainlineRef: 'origin/develop',
+  freshnessMode: 'off',
+  fetchThrottleSec: 60,
 };
 
 /** Đọc 1 file JSON, trả {} nếu thiếu/hỏng. @param {string} p @returns {object} */
@@ -27,17 +31,71 @@ function readJson(p) {
 }
 
 /**
+ * Rút PHẦN PATH (bỏ scheme/user/host) từ một remote URL — path-only vì cùng một
+ * repo có thể được trỏ bằng host khác nhau giữa các máy (ssh alias, ssh vs https).
+ * Trả null khi không nhận dạng được.
+ * @param {string} url
+ * @returns {string|null}
+ */
+export function originPath(url) {
+  let u = (url || '').trim();
+  if (!u) return null;
+  const scheme = u.match(/^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?[^/]+\/(.+)$/i);
+  const scp = u.match(/^(?:[^@/]+@)?[^:/]+:(.+)$/);
+  if (scheme) u = scheme[1];
+  else if (scp) u = scp[1];
+  else if (!path.isAbsolute(u)) return null; // không phải URL hosted / path tuyệt đối
+  return u.replace(/^\/+/, '').replace(/\.git$/i, '').toLowerCase() || null;
+}
+
+/**
+ * Derive projectKey từ origin của repo: `<slug segment cuối>-<sha1(path) 8 hex>`.
+ * Mọi clone cùng origin (mọi máy) ⇒ cùng key; dự án khác origin ⇒ khác key —
+ * fix kịch bản symlink `.claude/` dùng chung config vật lý (spec 2026-07-21 §4).
+ * Trả null khi repo không có remote origin / URL không nhận dạng được — caller
+ * giữ nguyên 'auto' để isConfigured() trả false (cc-lock trơ, không đoán bừa).
+ * @param {string} repoRoot
+ * @returns {string|null}
+ */
+export function deriveProjectKey(repoRoot) {
+  let url;
+  try {
+    url = execFileSync('git', ['-C', repoRoot, 'remote', 'get-url', 'origin'], {
+      encoding: 'utf8',
+    }).trim();
+  } catch {
+    return null;
+  }
+  const p = originPath(url);
+  if (!p) return null;
+  const last = (p.split('/').pop() || '').replace(/[^a-z0-9._-]/g, '-');
+  return `${last}-${sha1(p).slice(0, 8)}`;
+}
+
+/**
  * Thứ tự merge: DEFAULTS ← config chung (.claude/, commit theo repo dự án)
  * ← override per-clone (<stateDir>/cc-lock-local.json — cùng file với cờ on/off,
  * KHÔNG commit). Override cho phép một clone/máy trỏ lock-repo/projectKey riêng
  * mà không sửa file tracked — vd bật lock thật trên repo bộ khung đang ship
  * config placeholder.
+ * Sentinel "auto": derive từ origin — xem deriveProjectKey.
  * @param {string} repoRoot @returns {CcLockConfig}
  */
 export function loadConfig(repoRoot) {
   const shared = readJson(path.join(repoRoot, '.claude', 'cc-lock.config.json'));
   const local = readJson(path.join(stateDir(repoRoot), 'cc-lock-local.json'));
-  return /** @type {CcLockConfig} */ ({ ...DEFAULTS, ...shared, ...local });
+  const cfg = /** @type {CcLockConfig} */ ({ ...DEFAULTS, ...shared, ...local });
+  cfg.projectKeySource =
+    'projectKey' in local ? 'local' : 'projectKey' in shared ? 'config' : 'default';
+  if (cfg.projectKey === 'auto') {
+    const derived = deriveProjectKey(repoRoot);
+    if (derived) {
+      cfg.projectKey = derived;
+      cfg.projectKeySource = 'auto';
+    }
+    // derive fail ⇒ giữ 'auto' ⇒ isConfigured() false ⇒ cc-lock trơ
+  }
+  return cfg;
 }
 
 /**
@@ -56,6 +114,7 @@ export function isConfigured(cfg) {
   if (!url || url.includes('<')) return false;
   const key = cfg.projectKey;
   if (!key || key.includes('<')) return false;
+  if (key === 'auto') return false; // sentinel chưa derive được (repo không có origin)
   return true;
 }
 

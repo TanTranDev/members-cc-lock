@@ -1,7 +1,8 @@
 // @ts-check
 import fs from 'node:fs';
 import path from 'node:path';
-import { repoRoot, toRelpath, stateDir } from './paths.mjs';
+import { repoRoot, toRelpath, stateDir, classifyPath } from './paths.mjs';
+import { checkFreshness } from './freshness.mjs';
 import { loadConfig, resolveEnabled, isConfigured } from './config.mjs';
 import { cloneId, host } from './identity.mjs';
 import * as lock from './lock.mjs';
@@ -54,10 +55,15 @@ const fmtExpire = (epochSec) => new Date(epochSec * 1000).toLocaleTimeString();
  * PreToolUse hook: đọc JSON {tool_name, cwd, tool_input.file_path} từ stdin.
  * DENY = exit 2 + stderr (cơ chế chặn cứng của PreToolUse trong plan).
  *
- * ALLOW (exit 0) khi: tool ngoài guardedTools, cơ chế tắt, không phải repo,
- * file ngoài repo, hoặc acquire trả acquired|already-mine|reclaimed|disabled|
- * unconfigured|bypass (unconfigured = lockRepoUrl chưa điền ⇒ cc-lock trơ).
- * DENY (exit 2) khi: offline-deny (fail-closed) hoặc held/error.
+ * Pipeline 3 lớp (spec 2026-07-21 §5), chạy sau khi đã qua trơ-toàn-phần:
+ *   trơ (chưa config ⇒ exit 0) → lớp 1 escape → lớp 2 freshness → lớp 3 lock CAS.
+ * CC_LOCK_BYPASS bỏ qua lớp 1+2 (lớp 3 tự audit qua nhánh bypass của acquire).
+ *
+ * ALLOW (exit 0) khi: tool ngoài guardedTools, cơ chế tắt, không phải repo, chưa
+ * config (trơ), file ngoài repo, freshness fresh/skip/warn, hoặc acquire trả
+ * acquired|already-mine|reclaimed|disabled|unconfigured|bypass.
+ * DENY (exit 2) khi: symlink-escape, stale-base (freshnessMode=deny),
+ * offline-deny (fail-closed), hoặc held/error.
  */
 async function hookGuard() {
   /** @type {any} */
@@ -74,11 +80,51 @@ async function hookGuard() {
   const cfg = loadConfig(root.value);
   if (!cfg.guardedTools.includes(tool)) process.exit(0);
   if (!resolveEnabled(root.value, cfg).enabled) process.exit(0);
+  // Trơ TOÀN PHẦN khi chưa config: mọi lớp (escape/freshness/lock) đều bỏ qua —
+  // fresh clone chưa điền config không bao giờ bị brick (spec 2026-07-21 §5).
+  if (!isConfigured(cfg)) process.exit(0);
   const fp = input.tool_input?.file_path;
   if (!fp) process.exit(0);
-  const rel = toRelpath(root.value, fp);
-  if (!rel) process.exit(0); // file ngoài repo ⇒ không quản
 
+  // Lớp 1 — symlink-escape (spec §5.1). CC_LOCK_BYPASS bỏ qua lớp 1+2 (vượt rào
+  // khẩn cấp — lớp 3 tự audit qua nhánh bypass của acquire).
+  const bypass = !!process.env.CC_LOCK_BYPASS;
+  const cls = classifyPath(root.value, fp);
+  if (cls.kind === 'outside') process.exit(0); // file ngoài repo ⇒ không quản (v1)
+  if (cls.kind === 'escape' && !bypass) {
+    console.error(
+      `⛔ cc-lock SYMLINK-ESCAPE: ${fp}\n` +
+        `   → file vật lý: ${cls.realpath} (NGOÀI repo này — thường là repo bộ khung).\n` +
+        'Sửa tại repo chứa file thật (mở session ở đó), commit + push để các máy khác pull. ' +
+        '⇒ Xử lý theo skill cc-lock-coordination.',
+    );
+    process.exit(2);
+  }
+  const rel = cls.kind === 'inside' ? cls.relpath : toRelpath(root.value, fp);
+  if (!rel) process.exit(0);
+
+  // Lớp 2 — freshness (advisory, fail-open; spec §5.2)
+  if (!bypass && cfg.freshnessMode !== 'off') {
+    const f = checkFreshness(cfg, root.value, rel);
+    if (f.status === 'stale') {
+      if (cfg.freshnessMode === 'deny') {
+        console.error(
+          `⛔ cc-lock STALE-BASE: ${rel} đã đổi trên ${f.mainline} sau điểm rẽ nhánh của bạn\n` +
+            `   (mới nhất: ${f.subject}).\n` +
+            `Rebase rồi sửa tiếp:  git fetch origin && git rebase ${f.mainline}\n` +
+            'Nhánh feature của CHÍNH session: tự rebase nếu áp SẠCH; có conflict ⇒ dừng, hỏi user. ' +
+            '(skill cc-lock-coordination §STALE-BASE)',
+        );
+        process.exit(2);
+      }
+      // warn: systemMessage cho user, vẫn cho qua lớp 3
+      console.log(JSON.stringify({
+        systemMessage: `cc-lock: ${rel} đã đổi trên ${f.mainline} (${f.subject}) — nên rebase trước khi sửa.`,
+      }));
+    }
+  }
+
+  // Lớp 3 — lock CAS (không đổi so với v1)
   const r = lock.acquire(cfg, root.value, rel);
   if (r.status === 'bypass') {
     // Vượt rào khẩn cấp: cho ghi NHƯNG để vết audit qua stderr (không chặn tool,
@@ -160,6 +206,19 @@ export async function main(argv = process.argv.slice(2)) {
       console.log(JSON.stringify(lock.check(cfg, root, arg)));
       break;
     }
+    case 'fresh': {
+      if (!arg) {
+        console.error('usage: cc-lock fresh <relpath>');
+        process.exit(2);
+      }
+      const { root, cfg } = ctx();
+      // ép mode ≠ off để lệnh probe luôn trả lời thật (kể cả repo tắt freshness).
+      // arg = relpath cần soi (khớp help `[relpath]`); env truyền tường minh.
+      console.log(
+        JSON.stringify(checkFreshness({ ...cfg, freshnessMode: 'deny' }, root, arg, process.env)),
+      );
+      break;
+    }
     case 'renew': {
       const { root, cfg } = ctx();
       console.log(JSON.stringify(lock.renew(cfg, root, arg)));
@@ -205,14 +264,19 @@ export async function main(argv = process.argv.slice(2)) {
       const { root, cfg } = ctx();
       const e = resolveEnabled(root, cfg);
       if (!isConfigured(cfg)) {
-        console.log(
-          'active: false (lockRepoUrl chưa cấu hình — cc-lock đang trơ, mọi edit được phép)',
-        );
+        const why = cfg.projectKey === 'auto'
+          ? 'projectKey "auto" không derive được (repo không có remote origin?)'
+          : 'lockRepoUrl/projectKey chưa cấu hình';
+        console.log(`active: false (${why} — cc-lock đang trơ, mọi edit được phép)`);
       } else {
         console.log(`active: ${e.enabled}`);
       }
       console.log(`enabled: ${e.enabled} (source: ${e.source})`);
-      console.log(`lockRepo: ${cfg.lockRepoUrl || '(chưa cấu hình)'}  project: ${cfg.projectKey}`);
+      console.log(
+        `lockRepo: ${cfg.lockRepoUrl || '(chưa cấu hình)'}  project: ${cfg.projectKey}` +
+          ` (nguồn: ${cfg.projectKeySource === 'auto' ? 'auto ← origin' : cfg.projectKeySource})`,
+      );
+      console.log(`freshness: ${cfg.freshnessMode} (mainline: ${cfg.mainlineRef})`);
       console.log(`clone: ${cloneId(root)}`); // để so với owner khi bị DENY (skill B0)
       break;
     }
@@ -223,7 +287,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
     default:
       console.log(
-        'cc-lock <acquire|release|release-all|check|renew|wait|list|mine|gc|on|off|status|init> [relpath]',
+        'cc-lock <acquire|release|release-all|check|fresh|renew|wait|list|mine|gc|on|off|status|init> [relpath]',
       );
   }
 }

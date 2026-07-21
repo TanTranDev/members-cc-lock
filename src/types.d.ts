@@ -37,5 +37,9 @@ declare global {
     waitPollSec: number;
     offlinePolicy: 'fail-closed' | 'fail-open';
     guardedTools: string[];
+    mainlineRef: string;
+    freshnessMode: 'deny' | 'warn' | 'off';
+    fetchThrottleSec: number;
+    projectKeySource?: 'local' | 'config' | 'auto' | 'default';
   };
 }

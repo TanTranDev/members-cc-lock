@@ -61,35 +61,42 @@ Plugin trơ cho tới khi được cấu hình. Với **mỗi repo** muốn bậ
    ```text
    /cc-lock-setup
    ```
-   Lệnh sẽ hỏi **`lockRepoUrl`** + **`projectKey`** (gợi ý projectKey theo tên repo), ghi
-   `<repo>/.claude/cc-lock.config.json`, rồi `cc-lock init` + `cc-lock status`.
-3. **Commit `.claude/cc-lock.config.json`** vào repo dự án — mọi clone của cùng repo phải
-   dùng **cùng** `projectKey` mới chia sẻ khoá.
+   Lệnh chỉ hỏi **`lockRepoUrl`** — **`projectKey`** mặc định `"auto"` (engine tự derive
+   từ `git remote get-url origin`, không cần hỏi). Ghi `<repo>/.claude/cc-lock.config.json`,
+   rồi `cc-lock init` + `cc-lock status`. Chỉ khi user chủ động muốn override tường minh
+   (vd repo không có remote origin) mới hỏi thêm `projectKey`.
+3. **Commit `.claude/cc-lock.config.json`** vào repo dự án — mọi clone của cùng repo tự
+   chung `projectKey` (derive từ cùng origin) nên chia sẻ khoá được ngay, không cần đồng bộ
+   tay.
 
 > **Nhiều dự án dùng chung một lock-repo được** — ref tách theo
-> `refs/locks/<projectKey>/…`. Điều kiện DUY NHẤT: mỗi dự án một `projectKey` riêng.
+> `refs/locks/<projectKey>/…`. Điều kiện DUY NHẤT: mỗi dự án một `projectKey` riêng — với
+> `"auto"`, điều kiện này tự đúng vì mỗi dự án có origin khác nhau.
 
-Cấu hình đầy đủ (`/cc-lock-setup` chỉ hỏi 2 giá trị đầu; còn lại dùng default, sửa tay
+Cấu hình đầy đủ (`/cc-lock-setup` chỉ hỏi `lockRepoUrl`; còn lại dùng default, sửa tay
 trong file nếu cần):
 
 ```json
 {
   "enabled": true,
   "lockRepoUrl": "git@github.com:acme/cc-locks.git",
-  "projectKey": "my-project",
+  "projectKey": "auto",
   "refNamespace": "refs/locks",
   "ttlSec": 900,
   "heartbeatSec": 300,
   "skewSec": 60,
   "waitPollSec": 5,
   "offlinePolicy": "fail-closed",
-  "guardedTools": ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+  "guardedTools": ["Edit", "Write", "MultiEdit", "NotebookEdit"],
+  "mainlineRef": "origin/develop",
+  "freshnessMode": "deny",
+  "fetchThrottleSec": 60
 }
 ```
 
-**cc-lock chỉ kích hoạt khi CẢ `lockRepoUrl` VÀ `projectKey` là giá trị thật** (không
-rỗng, không chứa ký tự `<`). Chưa đủ ⇒ trơ (mọi edit được phép) — tránh footgun "clone
-mới không sửa được gì".
+**cc-lock chỉ kích hoạt khi `lockRepoUrl` là giá trị thật** (không rỗng, không chứa ký tự
+`<`); `projectKey` mặc định `"auto"` luôn coi là đủ (derive lúc load — xem mục 6). Chưa đủ
+⇒ trơ (mọi edit được phép) — tránh footgun "clone mới không sửa được gì".
 
 ---
 
@@ -97,7 +104,7 @@ mới không sửa được gì".
 
 | Command | Mục đích |
 |---|---|
-| `/cc-lock-setup` | Thiết lập lockRepoUrl + projectKey cho repo hiện tại, rồi init + status. |
+| `/cc-lock-setup` | Thiết lập `lockRepoUrl` cho repo hiện tại (`projectKey` mặc định `"auto"`), rồi init + status. |
 | `/cc-lock-status` | Trạng thái active / enabled + nguồn / lock-repo / projectKey / clone-id. |
 | `/cc-lock-list` | Liệt kê MỌI khoá của project trên lock-repo (clone nào giữ file nào). |
 | `/cc-lock-mine` | Khoá clone hiện tại đang giữ (cache local, 0 mạng). |
@@ -105,6 +112,7 @@ mới không sửa được gì".
 | `/cc-lock-release <relpath>` | Trả khoá một file (gọi ngay khi xong file). |
 | `/cc-lock-release-all` | Trả tất cả khoá clone này đang giữ. |
 | `/cc-lock-check <relpath>` | Soi trạng thái khoá một file (không cố giành). |
+| `/cc-lock-fresh <relpath>` | Soi file có stale so với mainline không (freshness probe, hoạt động kể cả khi `freshnessMode` đang `off`). |
 | `/cc-lock-acquire <relpath>` | Chủ động giành khoá trước (thường hook tự làm). |
 | `/cc-lock-renew <relpath>` | Gia hạn khoá đang giữ (heartbeat thủ công). |
 | `/cc-lock-gc` | Dọn các khoá đã hết hạn dưới project. |
@@ -173,11 +181,40 @@ bị **hoãn** tới lần merge cuối. Nguyên tắc rút ra: **thay đổi ng
 
 Hai giới hạn nữa: (a) hai session mở **cùng thư mục** = một clone ⇒ cc-lock **không** chặn
 nhau (muốn song song: mỗi session một worktree); (b) ghi file qua **Bash** (`echo >`,
-`sed -i`…) không bị canh — escape hatch đã biết (xem §7).
+`sed -i`…) không bị canh — escape hatch đã biết (xem §8).
 
 ---
 
-## 6. Bật / tắt
+## 6. v2 — auto projectKey · symlink-escape · fresh-base guard
+
+**1. `projectKey: "auto"` (mặc định của `/cc-lock-setup`)** — engine tự derive key từ
+`git remote get-url origin`: lấy PHẦN PATH của URL (bỏ scheme/user/host — ssh alias
+khác nhau giữa máy không ảnh hưởng), bỏ `.git`, lowercase; key = `<slug segment
+cuối>-<sha1(path) 8 hex>`. Mọi clone cùng origin ⇒ tự chung namespace khoá, không cần
+cấu hình từng clone/máy. Ưu tiên: local override tường minh > config tường minh > auto.
+Không có remote origin ⇒ cc-lock trơ + `status` nói rõ lý do.
+
+**2. Symlink-escape DENY** — file lexically trong repo nhưng file VẬT LÝ nằm ngoài
+(thư mục config/bộ khung symlink dùng chung) ⇒ hook DENY kèm hướng dẫn: sửa tại repo
+chứa file thật, commit + push để nơi khác pull. Symlink nội bộ repo vẫn cho qua, lock
+theo relpath thật (canonical).
+
+**3. Fresh-base guard** — trước khi acquire lock cho file F: fetch throttled
+(`fetchThrottleSec`, mặc định 60s, timeout 5s fail-fast) rồi kiểm F có đổi trên
+mainline (`mainlineRef`, mặc định `origin/develop`, fallback `origin/master`) sau
+merge-base không. Có ⇒ theo `freshnessMode`: `deny` (mặc định của `/cc-lock-setup` —
+chặn + hướng dẫn rebase) / `warn` / `off` (default engine khi config không có khoá).
+Lớp ADVISORY fail-open: offline so với ref local từ lần fetch trước, chưa từng fetch
+⇒ bỏ qua; lock CAS vẫn fail-closed. Probe: `/cc-lock-fresh <relpath>`. Xử lý DENY:
+skill `cc-lock-coordination` nhánh SB (tự rebase nhánh feature của chính session khi
+áp sạch; conflict ⇒ hỏi user).
+
+**Nâng cấp nhiều máy**: cập nhật plugin trên MỌI máy trong cùng đợt — máy chưa cập
+nhật dùng key cũ, hai máy tạm không thấy lock của nhau (TTL ngắn, không để rác).
+
+---
+
+## 7. Bật / tắt
 
 Phân giải theo **3 lớp**, ưu tiên cao → thấp, cộng quy tắc "chưa cấu hình ⇒ trơ":
 
@@ -195,7 +232,7 @@ dùng như thói quen.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 - **Lock kẹt / chủ biến mất.** TTL + heartbeat: chủ crash ⇒ khoá hết hạn ⇒ clone khác
   reclaim tự động (sau `skewSec`). Dọn chủ động: `/cc-lock-gc`.
@@ -216,7 +253,7 @@ Ghi file qua Bash (`echo >`, `sed -i`…) **không bị chặn**. Hãy tuân wor
 
 ---
 
-## 8. Cấu trúc plugin
+## 9. Cấu trúc plugin
 
 ```
 members-cc-lock/
@@ -225,12 +262,12 @@ members-cc-lock/
 │   └── marketplace.json      # marketplace một-plugin (name: members-cc-lock)
 ├── bin/cc-lock               # CLI entry (node)
 ├── src/*.mjs                 # lõi cc-lock (0 dep runtime)
-├── __tests__/*.mjs           # test (node --test) — 66 test
+├── __tests__/*.mjs           # test (node --test) — 94 test
 ├── hooks/hooks.json          # PreToolUse hook-guard + SessionEnd hook-release-all
 ├── scripts/cc-lock-setup.mjs # ghi/merge config vào repo đích (dùng bởi /cc-lock-setup)
 ├── skills/
 │   ├── cc-lock-coordination/ # skill xử lý va chạm (generic)
-│   └── cc-lock-<cmd>/         # 14 slash command bọc CLI
+│   └── cc-lock-<cmd>/         # 15 slash command bọc CLI
 ├── package.json · tsconfig.json
 └── README.md
 ```

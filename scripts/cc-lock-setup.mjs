@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 // @ts-check
 // Ghi/merge cấu hình cc-lock vào repo ĐÍCH (nơi bạn muốn bật khoá) —
-// KHÔNG đụng file nào của plugin. Chỉ điền 2 giá trị cốt lõi (lockRepoUrl,
-// projectKey); phần còn lại giữ default (hoặc giữ nguyên giá trị cũ nếu đã có).
+// KHÔNG đụng file nào của plugin. Chỉ điền 1 giá trị bắt buộc (lockRepoUrl);
+// projectKey mặc định 'auto' (tự derive từ origin của repo — mọi clone cùng
+// origin tự chung namespace khoá, không cần điền tay). Phần còn lại giữ
+// default (hoặc giữ nguyên giá trị cũ nếu đã có).
 //
 // Dùng bởi slash command /cc-lock-setup. Có thể chạy tay:
-//   node scripts/cc-lock-setup.mjs --url <lockRepoUrl> --key <projectKey>
+//   node scripts/cc-lock-setup.mjs --url <lockRepoUrl> [--key <projectKey>]
 //
 // Config phải nằm trong repo đích (<repo>/.claude/cc-lock.config.json) và commit
 // theo repo đó: mọi clone của cùng repo phải chia sẻ CÙNG projectKey mới khoá
-// chung được — đây là ràng buộc của cơ chế, không phải lựa chọn.
+// chung được — đây là ràng buộc của cơ chế, không phải lựa chọn. `--key` chỉ
+// cần khi muốn override tường minh (vd repo không có remote origin).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,7 +22,7 @@ import { execFileSync } from 'node:child_process';
 const TEMPLATE = {
   enabled: true,
   lockRepoUrl: '',
-  projectKey: '',
+  projectKey: 'auto',
   refNamespace: 'refs/locks',
   ttlSec: 900,
   heartbeatSec: 300,
@@ -27,6 +30,9 @@ const TEMPLATE = {
   waitPollSec: 5,
   offlinePolicy: 'fail-closed',
   guardedTools: ['Edit', 'Write', 'MultiEdit', 'NotebookEdit'],
+  mainlineRef: 'origin/develop',
+  freshnessMode: 'deny',
+  fetchThrottleSec: 60,
 };
 
 /** @param {string[]} argv @returns {{url?:string, key?:string}} */
@@ -60,15 +66,6 @@ function repoRoot() {
   return ''; // không tới được
 }
 
-/** Gợi ý projectKey từ tên repo (slug hoá tên thư mục toplevel). @param {string} root */
-function suggestKey(root) {
-  return path
-    .basename(root)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
 function main() {
   const { url, key } = parseArgs(process.argv.slice(2));
   const root = repoRoot();
@@ -90,6 +87,9 @@ function main() {
   if (url !== undefined) merged.lockRepoUrl = url;
   if (key !== undefined) merged.projectKey = key;
 
+  // lockRepoUrl là giá trị BẮT BUỘC duy nhất — không có default hợp lệ.
+  // projectKey luôn có giá trị nhờ default 'auto' (config.mjs tự derive từ origin
+  // lúc load); chỉ coi là thiếu khi bị sửa tay thành placeholder còn sót ký tự `<`.
   const missing = [];
   if (!merged.lockRepoUrl || String(merged.lockRepoUrl).includes('<')) missing.push('lockRepoUrl');
   if (!merged.projectKey || String(merged.projectKey).includes('<')) missing.push('projectKey');
@@ -104,7 +104,6 @@ function main() {
         configPath: cfgPath,
         lockRepoUrl: merged.lockRepoUrl,
         projectKey: merged.projectKey,
-        suggestedKey: suggestKey(root),
         missing,
         note: missing.length
           ? 'Còn thiếu giá trị thật — cc-lock vẫn TRƠ (mọi edit được phép) tới khi điền đủ.'

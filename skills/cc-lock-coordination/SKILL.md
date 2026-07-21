@@ -1,6 +1,6 @@
 ---
 name: cc-lock-coordination
-description: Use BEFORE editing files that other sessions may also touch (shared/high-traffic files, config, anything multiple branches change), AND whenever a cc-lock PreToolUse DENY appears (message "🔒 … is held by …", or offline-deny / fail-closed). cc-lock serializes concurrent Claude Code sessions across clones/worktrees via a shared lock-repo. On a DENY the correct move is to WAIT and retry, never to abandon the task. Triggers on: cc-lock, DENY, "is held by", "đang bị giữ", file lock, multi-session, lock collision, parallel agents.
+description: Use BEFORE editing files that other sessions may also touch (shared/high-traffic files, config, anything multiple branches change), AND whenever a cc-lock PreToolUse DENY appears (message "🔒 … is held by …", or offline-deny / fail-closed, or a STALE-BASE freshness DENY). cc-lock serializes concurrent Claude Code sessions across clones/worktrees via a shared lock-repo. On a DENY the correct move is to WAIT and retry, never to abandon the task. Triggers on: cc-lock, DENY, "is held by", "đang bị giữ", file lock, multi-session, lock collision, parallel agents, stale-base, fresh-base guard.
 ---
 
 # cc-lock — Multi-session collision coordination
@@ -8,8 +8,9 @@ description: Use BEFORE editing files that other sessions may also touch (shared
 cc-lock hard-blocks (DENY) a write when another clone/session currently holds that
 file. **A DENY is NOT a tool error** — it surfaces a coordination fact: two or more
 sessions want the same file. The lock is **transient**; the holder will release it
-(explicitly, or automatically when its TTL expires). This skill has two branches:
-**prevention** (before you touch a contended file) and **handling** (when you hit a DENY).
+(explicitly, or automatically when its TTL expires). This skill has three branches:
+**prevention** (before you touch a contended file), **handling** (when you hit a lock
+DENY), and **stale-base** (when you hit a freshness DENY — Branch SB).
 
 ## The one hard rule
 
@@ -55,6 +56,27 @@ user approval.
   deleting a half-written file, rebasing, or pushing, present the exact command and wait
   for the user. Never run `rm` / `git rebase` / `git push` on your own.
 
+## Branch SB — STALE-BASE (fresh-base guard v2)
+
+A DENY shaped like `cc-lock STALE-BASE: <file> has changed on <mainline>...` is **not**
+a lock collision — the file changed on the **mainline** branch after your branch's
+fork point, so continuing to edit against the old base risks a conflict at merge time.
+This DENY **never cancels the task** either. Handle it:
+
+- **SB1 🤖 Confirm.** Run `/cc-lock-fresh <relpath>` — it reports `stale` plus the
+  mainline ref and the commit that caused it.
+- **SB2 🤖 Self-rebase when ALL THREE hold:** (1) the current branch is a feature
+  branch YOU created for this task; (2) the working tree is clean (or cleanly
+  stashable); (3) the rebase applies with no conflicts. All three ⇒ act immediately,
+  no need to ask: `git fetch origin && git rebase <mainline from the DENY message>` →
+  `/cc-lock-fresh <relpath>` to confirm `fresh` → keep editing.
+- **SB3 🛑 Conflict / shared branch.** Rebase hits a conflict ⇒ `git rebase --abort`,
+  STOP, hand it to the user. Standing on a shared branch (develop/master) that is
+  behind origin ⇒ propose `git pull --ff-only` and wait — never pull a shared branch
+  on your own.
+- **SB4 🤖 Re-check the task after rebasing.** The mainline may have moved in ways
+  that make your task obsolete — re-read the relevant diff before writing more code.
+
 ## Hard principles
 
 - DENY + a **different** clone-id + `active: true` = a **real scope collision**. Don't dig
@@ -62,6 +84,8 @@ user approval.
 - **Never give up on the task because of a lock.** Waiting ~30s and retrying is the
   expected path; the holder will release soon.
 - Never autonomously `rm` / `git rebase` / `git push` — always show the command and wait.
+  **Sole exception:** self-rebasing your own feature branch when it applies cleanly
+  (SB2, Branch SB).
 - Confirm the collision cleared: `/cc-lock-list` shows the file free (or held by your own
   clone-id); `/cc-lock-mine` is empty after you finish.
 
@@ -71,4 +95,4 @@ user approval.
 - Slash commands provided by this plugin: `/cc-lock-status`, `/cc-lock-list`,
   `/cc-lock-mine`, `/cc-lock-wait`, `/cc-lock-release`, `/cc-lock-release-all`,
   `/cc-lock-check`, `/cc-lock-renew`, `/cc-lock-gc`, `/cc-lock-on`, `/cc-lock-off`,
-  `/cc-lock-init`, `/cc-lock-setup`.
+  `/cc-lock-init`, `/cc-lock-setup`, `/cc-lock-fresh`.
