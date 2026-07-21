@@ -1,0 +1,7 @@
+{
+  "name": "cc-lock",
+  "version": "0.1.0",
+  "description": "Multi-session file locking for Claude Code across clones/worktrees via git-refs CAS on a shared lock-repo. Hard-blocks (DENY) a write when another session holds that file. Inert until configured with /cc-lock-setup.",
+  "author": { "name": "ton" },
+  "keywords": ["lock", "multi-session", "coordination", "worktree", "git-refs", "concurrency"]
+}

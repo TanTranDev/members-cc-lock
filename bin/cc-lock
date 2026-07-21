@@ -1,0 +1,14 @@
+#!/usr/bin/env node
+// @ts-check
+import { main } from '../src/cli.mjs';
+
+// Lỗi bất ngờ (bug, env lạ) ⇒ exit 2 = DENY với PreToolUse hook — fail-closed,
+// KHÔNG bao giờ cho ghi thầm lặng vì crash (unhandled rejection mặc định exit 1,
+// mà PreToolUse chỉ chặn ở exit 2).
+main().catch((e) => {
+  console.error(
+    `cc-lock: lỗi bất ngờ — ${e && e.message ? e.message : e}. Fail-closed ⇒ chặn ghi; ` +
+      "CC_LOCK_BYPASS=1 để vượt khẩn cấp, hoặc 'cc-lock off' tắt cho clone này.",
+  );
+  process.exit(2);
+});

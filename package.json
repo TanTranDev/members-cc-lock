@@ -1,0 +1,17 @@
+{
+  "name": "cc-lock",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "cc-lock": "./bin/cc-lock"
+  },
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^6.0.3"
+  }
+}

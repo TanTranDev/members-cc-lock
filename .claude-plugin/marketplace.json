@@ -1,0 +1,13 @@
+{
+  "name": "members-cc-lock",
+  "owner": { "name": "ton" },
+  "description": "cc-lock — multi-session file locking plugin for Claude Code.",
+  "plugins": [
+    {
+      "name": "cc-lock",
+      "source": "./",
+      "description": "Hard-block concurrent writes to the same file across Claude Code sessions/clones/worktrees via git-refs CAS. Configure with /cc-lock-setup.",
+      "category": "workflow"
+    }
+  ]
+}
